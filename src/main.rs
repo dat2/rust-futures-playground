@@ -1,58 +1,91 @@
 extern crate futures;
 
 use std::thread;
+use std::time::Duration;
 use std::collections::VecDeque;
 use std::sync::{Arc,RwLock};
-use futures::{Future, Poll, Async};
+use futures::{Future, Poll, Async, task};
+use futures::task::Task;
 
-#[derive(Clone, Debug)]
-struct FutureQueue<T> {
-  queue: Arc<RwLock<VecDeque<T>>>
+struct DequeueFuture<'a, T: 'a + Clone> {
+  future_queue: &'a mut FutureQueue<T>
 }
 
-struct DequeueFuture<T> {
-  result: Option<T>
-}
-
-impl<T> DequeueFuture<T> {
-  fn new() -> DequeueFuture<T> {
-    DequeueFuture { result: None }
+impl<'a, T: Clone> DequeueFuture<'a, T> {
+  fn new(future_queue: &'a mut FutureQueue<T>) -> DequeueFuture<'a, T> {
+    DequeueFuture {
+      future_queue: future_queue
+    }
   }
 }
 
-impl<T> Future for DequeueFuture<T> {
+impl<'a, T: Clone> Future for DequeueFuture<'a, T> {
   type Item = T;
   type Error = usize;
 
   fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-    // TODO
     println!("POLL");
-    Ok(Async::NotReady)
+    match self.future_queue.next() {
+      Some(t) => Ok(Async::Ready(t)),
+      None => {
+        self.future_queue.register(task::park());
+        Ok(Async::NotReady)
+      }
+    }
   }
 }
 
-impl<T> FutureQueue<T> {
+#[derive(Clone)]
+struct FutureQueue<T: Clone> {
+  queue: VecDeque<T>,
+  tasks: VecDeque<Task>
+}
+
+impl<T: Clone> FutureQueue<T> {
   fn new() -> FutureQueue<T> {
-    FutureQueue { queue: Arc::new(RwLock::new(VecDeque::new())) }
+    FutureQueue {
+      queue: VecDeque::new(),
+      tasks: VecDeque::new()
+    }
   }
 
   fn enqueue(&mut self, t: T) {
-    let mut lock = self.queue.write().unwrap();
-    lock.push_front(t);
+    println!("ENQUEUE");
+    self.queue.push_front(t);
+    println!("{:?}", self.tasks.len());
+    if let Some(task) = self.tasks.pop_back() {
+      task.unpark();
+    }
   }
 
-  // TODO return a future
+  fn register(&mut self, task: Task) {
+    self.tasks.push_front(task);
+  }
+
+  fn next(&mut self) -> Option<T> {
+    self.queue.pop_back()
+  }
+
   fn dequeue(&mut self) -> DequeueFuture<T> {
-    DequeueFuture::new()
+    DequeueFuture::new(self)
   }
 }
 
 fn main() {
-  let mut future_queue = FutureQueue::new();
-  future_queue.enqueue(1);
+  let future_queue = Arc::new(RwLock::new(FutureQueue::new()));
 
-  let mut cloned = future_queue.clone();
+  let cloned = future_queue.clone();
+  thread::spawn(move|| {
+    loop {
+      thread::sleep(Duration::new(5, 0));
+      println!("enqueue");
+      cloned.write().unwrap().enqueue(1);
+    }
+  });
+
+  let cloned2 = future_queue.clone();
   thread::spawn(move || {
-    println!("{:?}", cloned.dequeue().wait());
+    let future = {  cloned2.write().unwrap().dequeue() };
+    println!("{:?}", future.wait());
   }).join().unwrap();
 }
